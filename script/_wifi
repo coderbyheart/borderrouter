@@ -1,0 +1,202 @@
+#!/bin/sh
+
+AP_CONN="Pi3-AP"
+ETH_CONN="Pi3-Eth"
+
+IPV6_HELPER_SCRIPT="/etc/NetworkManager/dispatcher.d/ipv6-helper"
+
+create_ap_connection()
+{
+	sudo nmcli c add type wifi ifname wlan0 con-name ${AP_CONN} ssid ${AP_CONN} 
+	sudo nmcli c modify ${AP_CONN} 802-11-wireless.mode ap 802-11-wireless.band bg ipv4.method shared
+	sudo nmcli c modify ${AP_CONN} wifi-sec.key-mgmt wpa-psk
+	sudo nmcli c modify ${AP_CONN} wifi-sec.proto rsn
+	sudo nmcli c modify ${AP_CONN} wifi-sec.psk "12345678"
+}
+
+create_wire_connection()
+{
+	sudo nmcli c add type ethernet ifname eth0 con-name ${ETH_CONN}
+	sudo nmcli c modify ${ETH_CONN} ipv6.method ignore
+}
+
+create_ipv6_helper()
+{
+	sudo tee ${IPV6_HELPER_SCRIPT} <<EOF
+#!/bin/bash
+
+NAME="ipv6-helper"
+
+IFNAME=\$1
+ACTION=\$2
+
+AP_CONN=${AP_CONN}
+
+DHCP_START="10.42.0.2"
+DHCP_END="10.42.0.8"
+
+ROUTER_IP="10.42.0.1"
+
+DNS1=\${ROUTER_IP}
+DNS2="8.8.8.8"
+
+
+log()
+{
+	logger -t "\${NAME}[\${\$}]" \$*
+}
+
+enable_accept_ra()
+{
+	log "Enable accepting Router Advertisements on the interface: '\${IFNAME}'" 
+	sysctl -w net.ipv6.conf.\${IFNAME}.accept_ra=2 
+}
+
+disable_accept_ra()
+{
+	log "Disable accepting Router Advertisements on the interface: '\${IFNAME}'" 
+	sysctl -w net.ipv6.conf.\${IFNAME}.accept_ra=1 
+}
+
+start_dnsmasq()
+{
+	log "Starting 'dnsmasq' on the interface: '${IFNAME}'"
+	/usr/sbin/dnsmasq -i \${IFNAME} -a \${ROUTER_IP} -b -z -K -F\${DHCP_START},\${DHCP_END},24h -p0 -O3,\${ROUTER_IP} -O6,\${DNS1},\${DNS2}
+}
+
+kill_dnsmasq()
+{
+ 	local DNSMASQ_PID=\`pidof dnsmasq\`
+
+	log "Killing 'dnsmasq' process with PID: '\${DNSMASQ_PID}'"
+	kill -9 \${DNSMASQ_PID}
+}
+
+start_dhcpcd()
+{
+	log "Starting 'dhcpcd' on the interface: '\${IFNAME}'"
+	/sbin/dhcpcd -6 -b -w -E \${IFNAME}
+}
+
+release_dhcpcd()
+{
+	log "Releasing 'dhcpcd' on the interface: '\${IFNAME}'"
+	/sbin/dhcpcd -6 -k \${IFNAME}
+}
+
+handle_action_up()
+{
+	case \${IFNAME} in
+	eth0)
+		enable_accept_ra
+		start_dhcpcd
+		;;
+	wlan0)
+		if [ \${CONNECTION_ID} = \${AP_CONN} ]; then
+			release_dhcpcd
+			disable_accept_ra
+			start_dnsmasq
+		else
+			kill_dnsmasq
+			enable_accept_ra
+			start_dhcpcd
+		fi
+		;;
+	*)
+		;;
+	esac
+
+}
+
+handle_action_down()
+{
+	case \${IFNAME} in
+	eth0)
+		release_dhcpcd
+		;;
+	wlan0)
+		if [ \${CONNECTION_ID} = \${AP_CONN} ]; then
+			kill_dnsmasq
+		else
+			release_dhcpcd
+		fi
+		;;
+	*)
+		log "Skipping action: '\${ACTION}' on the interface: '\${IFNAME}'"
+		;;
+	esac
+}
+
+
+case \${ACTION} in
+up)
+	handle_action_up
+	;;
+down)
+	handle_action_down
+	;;
+*)
+	log "Unsupported action: '\${ACTION}'"
+	;;
+esac
+
+EOF
+}
+
+
+wifi_install()
+{
+	with WIFI || return 0
+
+	sudo systemctl disable dhcpcd
+	sudo systemctl stop dhcpcd
+
+	sudo systemctl disable wpa_supplicant
+	sudo systemctl stop wpa_supplicant
+
+	if [ -n `pidof wpa_supplicant` ]; then 
+		sudo kill -s 9 `pidof wpa_supplicant` || true
+	fi
+
+	if [ -n `pidof dhcpcd` ]; then
+		sudo kill -s 9 `pidof dhcpcd` || true
+	fi
+	
+	create_ipv6_helper
+	sudo chmod a+x ${IPV6_HELPER_SCRIPT} 
+
+	sudo systemctl start network-manager
+
+	create_ap_connection
+	create_wire_connection 
+
+	sudo systemctl restart network-manager
+	sudo systemctl enable network-manager
+
+	sudo nmcli c up ${AP_CONN}
+	sudo nmcli c up ${ETH_CONN}
+}
+
+wifi_uninstall()
+{
+	with WIFI || return 0
+
+	if [ -z "pidof NetworkManager" ]; then
+		sudo systemctl start network-manager
+	fi
+
+	sudo nmcli c down ${AP_CONN} || true
+	sudo nmcli c delete ${AP_CONN} || true
+
+	sudo nmcli c down ${ETH_CONN} || true
+	sudo nmcli c delete ${ETH_CONN} || true
+
+	sudo systemctl disable network-manager
+	sudo systemctl stop network-manager
+	
+	sudo rm ${IPV6_HELPER_SCRIPT} || true
+
+	sudo systemctl start dhcpcd
+	sudo systemctl enable dhcpcd
+}
+

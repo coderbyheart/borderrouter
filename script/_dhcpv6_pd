@@ -34,6 +34,7 @@
 #
 
 WAN_INTERFACE="eth0"
+WLAN_INTERFACE="wlan0"
 
 WPANTUND_INTERFACE="wpan0"
 WPANTUND_ENV="/etc/default/wpantund"
@@ -64,9 +65,6 @@ hostname
 # Use the same DUID + IAID as set in DHCPv6 for DHCPv4 ClientID as per RFC4361.
 duid
 
-# Persist interface configuration when dhcpcd exits.
-persistent
-
 # Rapid commit support.
 # Safe to enable by default because it requires the equivalent option set
 # on the server to actually work.
@@ -85,22 +83,33 @@ option ntp_servers
 require dhcp_server_identifier
 
 # Generate Stable Private IPv6 Addresses instead of hardware based ones
-slaac private
+slaac hwaddr 
 
 # A hook script is provided to lookup the hostname if not set by the DHCP
 # server, but it should not be run by default.
 nohook lookup-hostname
+nohook wpa_supplicant
+
+denyinterfaces nat* wpan*
 
 noipv6rs
 
 interface $WPANTUND_INTERFACE
+iaid 0
 nodhcp
 nodhcp6
 
 interface $WAN_INTERFACE
+iaid 1
 ipv6rs
-ia_na 1
-ia_pd 2/::/63 $WPANTUND_INTERFACE/1
+ia_na 2 
+ia_pd 3/::/63 $WPANTUND_INTERFACE/1
+
+interface $WLAN_INTERFACE 
+iaid 4
+ipv6rs
+ia_na 5
+ia_pd 6/::/63 $WPANTUND_INTERFACE/1
 
 EOF
 }
@@ -126,8 +135,10 @@ WATCH1="type='signal', interface=\${WPANTUND_IFACE}, path=\${WPANTUND_NCP_STATE_
 
 reload_dhcpcd_daemon()
 {
-        systemctl force-reload dhcpcd
-        systemctl reload-daemon
+	for interface in `pgrep dhcpcd -a -x | rev | cut -d" " -f1 | rev`; do
+		/sbin/dhcpcd -6 -n \${interface}
+	done
+
         logger -t "\${NAME}[\${PID}]" "Reload: dhcpcd daemon"
 }
 
@@ -183,6 +194,7 @@ dhcpv6_pd_install()
     if have systemctl; then
         create_dhcpcd_reloader_service
 
+	sudo systemctl daemon-reload || true
         sudo systemctl restart dhcpcd || die 'Unable to restart dhcpcd!'
 
         sudo systemctl start dhcpcd_reloader.service || die 'Unable to start dhcpcd_reloader!'
@@ -211,3 +223,4 @@ dhcpv6_pd_uninstall()
         sudo systemctl restart dhcpcd.service || true
     fi
 }
+
